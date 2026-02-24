@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <!--
+        iOS FIX: viewport-fit=cover ensures the layout fills the safe area on notched iPhones.
+        user-scalable=no prevents accidental pinch-zoom on the UI panel.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+    <title>华北实时沙尘流动可视化</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            overflow: hidden;
+            font-family: -apple-system, 'Segoe UI', Tahoma, sans-serif;
+            /* iOS FIX: prevent elastic overscroll */
+            overscroll-behavior: none;
+            -webkit-overflow-scrolling: auto;
+        }
+
+        /*
+            iOS FIX — THE CORE ARCHITECTURAL CHANGE:
+            A single wrapper establishes the coordinate space.
+            Both #map and #dust-canvas are absolute children of this wrapper,
+            so they always share the same top-left origin.
+
+            Critically, #dust-canvas is NOT inside Leaflet's DOM.
+            Leaflet applies transform: translate3d() to its internal panes
+            during pan/zoom on iOS, which physically shifts any canvas inside it.
+            By living outside Leaflet entirely, our canvas is immune to those transforms.
+        */
+        #wrapper {
+            position: relative;
+            width: 100%;
+            /* iOS FIX: 100vh includes the Safari address bar on iOS.
+               We override this with JS (window.innerHeight) on load and resize. */
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #dust-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            /*
+                z-index 关键修复：Leaflet tilePane=200, overlayPane=400, markerPane=600
+                设为 500 确保 canvas 始终在地图瓦片之上，不会被地图加载后覆盖
+            */
+            z-index: 500;
+            will-change: transform;
+            -webkit-transform: translateZ(0);
+            transform: translateZ(0);
+        }
+
+        /* ─── UI PANEL (米黄色 / warm beige) ─── */
+        #ui-panel {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            z-index: 9999;
+            /* 米黄色 background */
+            background: #f5edd8;
+            border: 1px solid #c9b896;
+            padding: 16px 18px;
+            border-radius: 12px;
+            /* Dark warm-brown text to contrast with beige */
+            color: #2c2010;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+            width: 280px;
+            /* iOS FIX: respect safe-area insets for notched phones */
+            padding-left: max(18px, env(safe-area-inset-left, 18px));
+        }
+
+        h1 {
+            margin: 0 0 11px 0;
+            font-size: 1.1rem;
+            color: #1a1008;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+
+        .status-box {
+            padding: 8px 11px;
+            border-radius: 6px;
+            margin-bottom: 13px;
+            border-left: 3px solid #aaa;
+            background: rgba(0, 0, 0, 0.06);
+            font-size: 0.81rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #2c2010;
+        }
+
+        .status-box.live {
+            border-color: #2e9e50;
+            color: #1a5c2c;
+        }
+
+        .status-box.mock {
+            border-color: #b07d10;
+            color: #6b4a00;
+        }
+
+        .status-box.loading {
+            border-color: #2070c0;
+            color: #14468a;
+        }
+
+        .dot {
+            flex-shrink: 0;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 0 6px currentColor;
+        }
+
+        @keyframes blink {
+            50% {
+                opacity: 0.15;
+            }
+        }
+
+        .dot.blink {
+            animation: blink 1.2s infinite;
+        }
+
+        .legend-label {
+            font-size: 0.77rem;
+            color: #5a4020;
+            margin-bottom: 5px;
+        }
+
+        .legend-bar {
+            height: 8px;
+            border-radius: 4px;
+            margin-bottom: 4px;
+            background: linear-gradient(to right, #00e400, #ffff00, #ff7e00, #ff0000, #8f3f97, #7e0023);
+        }
+
+        .legend-ticks {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.67rem;
+            color: #8a6840;
+        }
+
+        .note {
+            font-size: 0.71rem;
+            color: #9a7850;
+            margin-top: 11px;
+            line-height: 1.55;
+        }
+
+        /* ─── 搜索框 ─── */
+        .search-wrap {
+            margin-top: 13px;
+            display: flex;
+            gap: 6px;
+        }
+
+        #search-input {
+            flex: 1;
+            padding: 7px 10px;
+            border-radius: 7px;
+            border: 1px solid #c9b896;
+            background: #fffdf7;
+            font-size: 0.85rem;
+            color: #2c2010;
+            outline: none;
+        }
+
+        #search-input:focus {
+            border-color: #a07830;
+            box-shadow: 0 0 0 2px rgba(160, 120, 48, 0.2);
+        }
+
+        #search-btn {
+            padding: 7px 0;
+            width: 64px;
+            /* 固定宽度，防止文字切换时按钮变宽溢出 */
+            flex-shrink: 0;
+            border-radius: 7px;
+            border: none;
+            background: #b07d10;
+            color: #fff;
+            font-size: 0.85rem;
+            cursor: pointer;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: background 0.2s;
+        }
+
+        #search-btn:hover {
+            background: #8a6000;
+        }
+
+        #search-btn:disabled {
+            background: #ccc;
+            cursor: default;
+        }
+
+        /* ─── 查询结果卡片 ─── */
+        #search-result {
+            margin-top: 10px;
+            display: none;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.06);
+            border-left: 3px solid #aaa;
+        }
+
+        #search-result .city-name {
+            font-weight: 700;
+            font-size: 0.92rem;
+            color: #1a1008;
+            margin-bottom: 5px;
+        }
+
+        #search-result .pm-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #search-result .pm-val {
+            font-size: 1.4rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+
+        #search-result .pm-unit {
+            font-size: 0.72rem;
+            color: #6a5030;
+            line-height: 1.3;
+        }
+
+        #search-result .aqi-badge {
+            margin-left: auto;
+            padding: 3px 9px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        #search-result .wind-row {
+            margin-top: 5px;
+            font-size: 0.75rem;
+            color: #6a5030;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!--
+    LAYOUT: wrapper → map (Leaflet) + canvas (our overlay, sibling not child of Leaflet)
+    This is the key iOS fix — canvas never enters Leaflet's transform-animated DOM tree.
+-->
+    <div id="wrapper">
+        <div id="map"></div>
+        <canvas id="dust-canvas"></canvas>
+
+        <div id="ui-panel">
+            <h1>华北沙尘动力学演播</h1>
+            <div id="status-box" class="status-box loading">
+                <span class="dot blink"></span>
+                <span id="status-text">正在初始化...</span>
+            </div>
+            <div class="legend-label">沙尘浓度 PM10 (μg/m³)</div>
+            <div class="legend-bar"></div>
+            <div class="legend-ticks">
+                <span>0</span><span>50</span><span>100</span><span>250</span><span>400+</span>
+            </div>
+            <p class="note">IDW 空间插值 + Canvas 粒子系统<br>实时风场驱动，颜色映射 PM10 浓度</p>
+
+            <!-- 城市 PM10 查询框 -->
+            <div class="search-wrap">
+                <input id="search-input" type="text" placeholder="输入城市，如北京" maxlength="30" autocomplete="off"
+                    autocorrect="off" spellcheck="false">
+                <button id="search-btn" onclick="searchCity()">查询</button>
+            </div>
+            <div id="search-result">
+                <div class="city-name" id="sr-city"></div>
+                <div class="pm-row">
+                    <span class="pm-val" id="sr-val"></span>
+                    <span class="pm-unit">μg/m³<br>PM10</span>
+                    <span class="aqi-badge" id="sr-badge"></span>
+                </div>
+                <div class="wind-row" id="sr-wind"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        "use strict";
+
+        // ═══════════════════════════════════════════════════════════
+        // 1. SHARED STATE  (all declared first — no TDZ errors)
+        // ═══════════════════════════════════════════════════════════
+        let gridData = [];
+        let screenField = [];
+        let animating = false;
+        // 数据覆盖区域在屏幕上的像素边界（随地图平移/缩放更新）
+        let dataBounds = { minX: 0, maxX: 0, minY: 0, maxY: 0, valid: false };
+
+        // 华北采样区域地理边界（必须在 rebuildField 调用前声明）
+        const DATA_LAT_N = 44, DATA_LAT_S = 36;
+        const DATA_LON_W = 110, DATA_LON_E = 120;
+
+        // Logical CSS-pixel dimensions (not physical pixels)
+        let W = window.innerWidth;
+        let H = window.innerHeight;
+
+        // iOS FIX: read devicePixelRatio once; used for physical canvas buffer sizing
+        const DPR = Math.min(window.devicePixelRatio || 1, 3); // cap at 3× to protect memory on older iPhones
+
+        const FIELD_COLS = 80;
+        const FIELD_ROWS = 80;
+        const NUM_PARTICLES = 4500;
+
+        // 30-point sampling grid over North China
+        const lats = [], lons = [];
+        for (let la = 36; la <= 44; la += 2)
+            for (let lo = 110; lo <= 120; lo += 2) { lats.push(la); lons.push(lo); }
+
+        // ═══════════════════════════════════════════════════════════
+        // 2. FIX iOS VIEWPORT HEIGHT
+        //    window.innerHeight excludes the Safari address bar;
+        //    applying it to the wrapper avoids the 100vh overflow bug.
+        // ═══════════════════════════════════════════════════════════
+        const wrapper = document.getElementById('wrapper');
+        function fixViewportHeight() {
+            W = window.innerWidth;
+            H = window.innerHeight;
+            wrapper.style.height = H + 'px';
+        }
+        fixViewportHeight();
+        window.addEventListener('resize', fixViewportHeight);
+        window.addEventListener('orientationchange', () => {
+            // iOS fires orientationchange before innerHeight updates — wait one frame
+            setTimeout(fixViewportHeight, 120);
+        });
+
+        // ═══════════════════════════════════════════════════════════
+        // 3. LEAFLET MAP
+        // ═══════════════════════════════════════════════════════════
+        const map = L.map('map', {
+            zoomControl: false,
+            attributionControl: false,
+            // iOS FIX: tap causes ghost clicks on iOS; disabling it prevents double-fire
+            tap: false,
+            bounceAtZoomLimits: false
+        }).setView([39.9, 116.4], 6);
+
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+        // Esri World Imagery 卦星图（免费、无需 API Key）
+        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 16, minZoom: 4,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+            detectRetina: true
+        }).addTo(map);
+
+        // 叠加一层微透明白花/地名图，再读性更好
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', {
+            subdomains: 'abcd', maxZoom: 16, minZoom: 4,
+            opacity: 0.8, pane: 'overlayPane'
+        }).addTo(map);
+
+        // ═══════════════════════════════════════════════════════════
+        // 4. CANVAS SETUP
+        //    The canvas is a sibling of #map, NOT inside Leaflet's DOM.
+        //    Leaflet applies CSS transforms to its internal panes (tilePane,
+        //    overlayPane, etc.) during pan/zoom on iOS Safari — any canvas
+        //    inside those panes inherits the transform and visually separates
+        //    from the particle field, which is computed in raw screen pixels.
+        //    By sitting alongside #map in our own wrapper, this canvas is
+        //    entirely immune to Leaflet's transforms.
+        // ═══════════════════════════════════════════════════════════
+        const canvas = document.getElementById('dust-canvas');
+        const ctx = canvas.getContext('2d', { alpha: true });
+
+        function sizeCanvas() {
+            W = window.innerWidth;
+            H = window.innerHeight;
+
+            // Physical pixel buffer — sharp on Retina / iOS displays
+            canvas.width = W * DPR;
+            canvas.height = H * DPR;
+
+            // CSS size stays at logical pixels so it fills the wrapper exactly
+            canvas.style.width = W + 'px';
+            canvas.style.height = H + 'px';
+
+            // Scale the drawing context so all our coordinates stay in logical pixels
+            // ctx.setTransform resets any previous scale before re-applying
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+            if (gridData.length > 0) rebuildField();
+        }
+
+        window.addEventListener('resize', sizeCanvas);
+        window.addEventListener('orientationchange', () => setTimeout(sizeCanvas, 120));
+
+        // ═══════════════════════════════════════════════════════════
+        // 5. MAP INTERACTION — hide canvas while panning to prevent
+        //    visible mis-registration on slower iOS devices, then
+        //    immediately rebuild from the new viewport on moveend.
+        // ═══════════════════════════════════════════════════════════
+        map.on('movestart', () => { canvas.style.opacity = '0'; });
+        map.on('zoomstart', () => { canvas.style.opacity = '0'; });
+        map.on('moveend', () => { rebuildField(); canvas.style.opacity = '1'; });
+        map.on('zoomend', () => { rebuildField(); canvas.style.opacity = '1'; });
+
+        // ═══════════════════════════════════════════════════════════
+        // 6. BOOT SEQUENCE (map.whenReady ensures Leaflet is fully
+        //    initialised before we read bounds or start drawing)
+        // ═══════════════════════════════════════════════════════════
+        map.whenReady(() => {
+            sizeCanvas();
+            generateMockData();   // instant — no network wait
+            rebuildField();
+            startAnimation();
+            fetchLiveData();      // background — silently upgrades data if API available
+        });
+
+        // ═══════════════════════════════════════════════════════════
+        // 7. MOCK DATA  — dramatic North China cyclone + dust plume
+        // ═══════════════════════════════════════════════════════════
+        function generateMockData() {
+            gridData = [];
+            const cLat = 40.5, cLon = 115.0;
+            for (let i = 0; i < lats.length; i++) {
+                const dLat = lats[i] - cLat;
+                const dLon = lons[i] - cLon;
+                const dist = Math.sqrt(dLat * dLat + dLon * dLon);
+                const angle = Math.atan2(dLat, dLon) * (180 / Math.PI);
+                gridData.push({
+                    lat: lats[i],
+                    lon: lons[i],
+                    pm10: Math.min(820, 55 + Math.max(0, 570 - dist * 118)
+                        + (dLat > 0 && dLon < 0 ? 290 : 0)),
+                    windSpeed: Math.min(28, dist * 9 + 4),
+                    windDir: (angle + 90 + 360) % 360
+                });
+            }
+            setStatus('mock', '脱机动力学模拟引擎已启动');
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 8. LIVE DATA  (non-blocking; mock stays active as fallback)
+        // ═══════════════════════════════════════════════════════════
+        async function fetchLiveData() {
+            setStatus('loading', '正在请求气象卫星栅格...');
+            try {
+                const aqUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lats.join(',')}&longitude=${lons.join(',')}&current=pm10`;
+                const windUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats.join(',')}&longitude=${lons.join(',')}&current=wind_speed_10m,wind_direction_10m`;
+
+                const [aqRes, windRes] = await Promise.all([fetch(aqUrl), fetch(windUrl)]);
+                if (!aqRes.ok || !windRes.ok)
+                    throw new Error(`HTTP ${aqRes.status}/${windRes.status}`);
+
+                const aqRaw = await aqRes.json();
+                const windRaw = await windRes.json();
+
+                // Open-Meteo batch mode returns an array; single-point returns an object
+                const aqArr = Array.isArray(aqRaw) ? aqRaw : (aqRaw.error ? null : [aqRaw]);
+                const windArr = Array.isArray(windRaw) ? windRaw : (windRaw.error ? null : [windRaw]);
+                if (!aqArr || !windArr || aqArr.length < 2)
+                    throw new Error('API 返回格式异常或超出限额');
+
+                gridData = lats.map((lat, i) => ({
+                    lat,
+                    lon: lons[i],
+                    pm10: aqArr[i]?.current?.pm10 ?? 50,
+                    windSpeed: windArr[i]?.current?.wind_speed_10m ?? 5,
+                    windDir: windArr[i]?.current?.wind_direction_10m ?? 0
+                }));
+
+                rebuildField();
+                setStatus('live', '实况气象矩阵已接入');
+            } catch (e) {
+                console.warn('[dust] live fetch failed — staying in mock mode:', e.message);
+                setStatus('mock', `模拟引擎运行中`);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 9. IDW SPATIAL INTERPOLATION
+        // ═══════════════════════════════════════════════════════════
+        function idw(lat, lon) {
+            let wSum = 0, pm10S = 0, uS = 0, vS = 0;
+            for (const p of gridData) {
+                const d2 = (p.lat - lat) ** 2 + (p.lon - lon) ** 2;
+                const w = 1 / Math.max(d2, 1e-4);
+                wSum += w;
+                pm10S += p.pm10 * w;
+                const rad = (p.windDir + 180) * Math.PI / 180;
+                uS += p.windSpeed * Math.sin(rad) * w;
+                vS += p.windSpeed * Math.cos(rad) * w;
+            }
+            return { pm10: pm10S / wSum, u: uS / wSum, v: vS / wSum };
+        }
+
+
+        // Pre-compute a grid of field vectors in screen-space.
+        // Always called after data changes or map moves, using the current viewport bounds.
+        function rebuildField() {
+            if (gridData.length === 0) return;
+            const b = map.getBounds();
+            const north = b.getNorth(), south = b.getSouth();
+            const west = b.getWest(), east = b.getEast();
+            const next = [];
+            for (let r = 0; r < FIELD_ROWS; r++) {
+                const row = [];
+                const lat = north - (north - south) * (r / FIELD_ROWS);
+                for (let c = 0; c < FIELD_COLS; c++) {
+                    row.push(idw(lat, west + (east - west) * (c / FIELD_COLS)));
+                }
+                next.push(row);
+            }
+            screenField = next; // atomic swap — safe even mid-frame
+
+            // 计算数据覆盖区域（华北采样框）对应的屏幕像素坐标
+            // 四个角点取极值，适应任意旋转视图
+            const nwPt = map.latLngToContainerPoint(L.latLng(DATA_LAT_N, DATA_LON_W));
+            const nePt = map.latLngToContainerPoint(L.latLng(DATA_LAT_N, DATA_LON_E));
+            const swPt = map.latLngToContainerPoint(L.latLng(DATA_LAT_S, DATA_LON_W));
+            const sePt = map.latLngToContainerPoint(L.latLng(DATA_LAT_S, DATA_LON_E));
+            const MARGIN = 30; // 像素边距，让边缘粒子有渐出空间
+            dataBounds = {
+                minX: Math.min(nwPt.x, swPt.x) - MARGIN,
+                maxX: Math.max(nePt.x, sePt.x) + MARGIN,
+                minY: Math.min(nwPt.y, nePt.y) - MARGIN,
+                maxY: Math.max(swPt.y, sePt.y) + MARGIN,
+                valid: true
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 10. PARTICLE SYSTEM
+        // ═══════════════════════════════════════════════════════════
+        function makeParticle(scatter) {
+            // 在数据覆盖区域内随机生成粒子，避免粒子出现在海域等数据范围之外
+            const bx = dataBounds.valid ? dataBounds : { minX: 0, maxX: W, minY: 0, maxY: H };
+            // 将边界约束在可见屏幕内
+            const x0 = Math.max(bx.minX, 0);
+            const y0 = Math.max(bx.minY, 0);
+            const x1 = Math.min(bx.maxX, W);
+            const y1 = Math.min(bx.maxY, H);
+            return {
+                x: x0 + Math.random() * (x1 - x0),
+                y: y0 + Math.random() * (y1 - y0),
+                age: scatter ? Math.floor(Math.random() * 80) : 0,
+                lifespan: 55 + Math.random() * 65
+            };
+        }
+
+        const particles = Array.from({ length: NUM_PARTICLES }, () => makeParticle(true));
+
+        // AQI colour ramp
+        function pm10Color(v) {
+            if (v < 50) return '#00e452';
+            if (v < 100) return '#e8e020';
+            if (v < 150) return '#ff8c00';
+            if (v < 250) return '#ff2828';
+            if (v < 400) return '#cc40d8';
+            return '#8b0020';
+        }
+
+        function drawFrame() {
+            ctx.clearRect(0, 0, W, H);
+
+            if (screenField.length > 0 && dataBounds.valid) {
+                const { minX, maxX, minY, maxY } = dataBounds;
+
+                // ── 用 clip 把粒子裁剪到数据覆盖框内 ──────────────────
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(minX, minY, maxX - minX, maxY - minY);
+                ctx.clip();
+
+                for (const p of particles) {
+                    const c = Math.floor((p.x / W) * FIELD_COLS);
+                    const r = Math.floor((p.y / H) * FIELD_ROWS);
+
+                    if (r >= 0 && r < FIELD_ROWS && c >= 0 && c < FIELD_COLS) {
+                        const f = screenField[r][c];
+                        p.x += f.u * 0.44;
+                        p.y -= f.v * 0.44;
+
+                        const life = 1 - p.age / p.lifespan;
+                        // 圆彩卦星底图较亮，适当提高粒子不透明度以保持可见性
+                        ctx.globalAlpha = 0.55 + life * 0.40;
+                        ctx.fillStyle = pm10Color(f.pm10);
+                        ctx.beginPath();
+                        ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    p.age++;
+                    if (p.age > p.lifespan || p.x < minX - 12 || p.x > maxX + 12
+                        || p.y < minY - 12 || p.y > maxY + 12) {
+                        const n = makeParticle(false);
+                        p.x = n.x; p.y = n.y; p.age = 0; p.lifespan = n.lifespan;
+                    }
+                }
+                ctx.globalAlpha = 1;
+                ctx.restore();
+
+                // ── 软边缘遮罩：在 dataBounds 四条边叠加渐变，让裁剪线柔和 ──
+                const FADE = 40; // 渐变宽度（像素）
+                const addFade = (x0, y0, x1, y1, fx0, fy0, fx1, fy1) => {
+                    const g = ctx.createLinearGradient(fx0, fy0, fx1, fy1);
+                    g.addColorStop(0, 'rgba(0,0,0,0)');
+                    g.addColorStop(1, 'rgba(0,0,0,0)'); // 透明→透明，仅清除粒子颜色
+                    // 实际用 destination-out 擦除边缘
+                    ctx.save();
+                    ctx.globalCompositeOperation = 'destination-out';
+                    const gfade = ctx.createLinearGradient(fx0, fy0, fx1, fy1);
+                    gfade.addColorStop(0, 'rgba(0,0,0,1)');
+                    gfade.addColorStop(1, 'rgba(0,0,0,0)');
+                    ctx.fillStyle = gfade;
+                    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+                    ctx.restore();
+                };
+                // 左边缘
+                addFade(minX, minY, minX + FADE, maxY, minX, 0, minX + FADE, 0);
+                // 右边缘
+                addFade(maxX - FADE, minY, maxX, maxY, maxX - FADE, 0, maxX, 0);
+                // 上边缘
+                addFade(minX, minY, maxX, minY + FADE, 0, minY, 0, minY + FADE);
+                // 下边缘
+                addFade(minX, maxY - FADE, maxX, maxY, 0, maxY - FADE, 0, maxY);
+            }
+
+            requestAnimationFrame(drawFrame);
+        }
+
+        function startAnimation() {
+            if (animating) return;
+            animating = true;
+            requestAnimationFrame(drawFrame);
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 11. STATUS UI HELPER
+        // ═══════════════════════════════════════════════════════════
+        function setStatus(type, msg) {
+            const box = document.getElementById('status-box');
+            const text = document.getElementById('status-text');
+            const dot = box.querySelector('.dot');
+            box.className = `status-box ${type}`;
+            text.textContent = msg;
+            dot.classList.toggle('blink', type === 'loading');
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 12. 城市 PM10 查询
+        // ═══════════════════════════════════════════════════════════
+
+        // 允许回车触发查询
+        document.getElementById('search-input').addEventListener('keydown', e => {
+            if (e.key === 'Enter') searchCity();
+        });
+
+        // 当前查询标记（地图上彩色圆圈 + Popup）
+        let searchMarker = null;
+
+        // AQI 等级文字 + 颜色
+        function aqiLevel(v) {
+            if (v < 50) return { label: '优', bg: '#00c450' };
+            if (v < 100) return { label: '良', bg: '#c8c000' };
+            if (v < 150) return { label: '轻度', bg: '#ff8c00' };
+            if (v < 250) return { label: '中度', bg: '#e02020' };
+            if (v < 400) return { label: '重度', bg: '#9b30b0' };
+            return { label: '严重', bg: '#7a0018' };
+        }
+
+        // 风向角度转中文
+        function windDirText(deg) {
+            const dirs = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+            return dirs[Math.round(deg / 45) % 8];
+        }
+
+        async function searchCity() {
+            const input = document.getElementById('search-input');
+            const btn = document.getElementById('search-btn');
+            const city = input.value.trim();
+            if (!city) return;
+
+            btn.disabled = true;
+            btn.textContent = '查询中…';
+
+            try {
+                // ① Nominatim 地理编码（OpenStreetMap，免费无需 Key）
+                const geoUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1&accept-language=zh`;
+                const geoRes = await fetch(geoUrl, { headers: { 'Accept-Language': 'zh' } });
+                const geoArr = await geoRes.json();
+
+                if (!geoArr.length) {
+                    alert(`未找到城市"${city}"，请检查拼写。`);
+                    return;
+                }
+
+                const { lat, lon, display_name } = geoArr[0];
+                const latF = parseFloat(lat), lonF = parseFloat(lon);
+
+                // ② IDW 插值取该坐标的 PM10 + 风场
+                if (gridData.length === 0) {
+                    alert('数据尚未加载，请稍候再试。');
+                    return;
+                }
+                const { pm10, u, v } = idw(latF, lonF);
+                const speed = Math.sqrt(u * u + v * v).toFixed(1);
+                const dir = ((Math.atan2(u, v) * 180 / Math.PI) + 360) % 360;
+                const pm10r = Math.round(pm10);
+                const level = aqiLevel(pm10r);
+
+                // ③ 地图飞行到该城市
+                map.flyTo([latF, lonF], Math.max(map.getZoom(), 7), { duration: 1.2 });
+
+                // ④ 移除旧标记，添加新彩色圆圈标注
+                if (searchMarker) map.removeLayer(searchMarker);
+                searchMarker = L.circleMarker([latF, lonF], {
+                    radius: 14, color: '#fff', weight: 2,
+                    fillColor: level.bg, fillOpacity: 0.88, pane: 'markerPane'
+                }).addTo(map);
+
+                // 带城市名和 PM10 的 Popup
+                searchMarker.bindPopup(
+                    `<b style="font-size:1rem">${city}</b><br>` +
+                    `PM10: <b style="color:${level.bg}">${pm10r} μg/m³</b><br>` +
+                    `等级: <b>${level.label}</b><br>` +
+                    `风速: ${speed} m/s&nbsp;&nbsp;风向: ${windDirText(dir)}`,
+                    { maxWidth: 180 }
+                ).openPopup();
+
+                // ⑤ 结果卡片
+                document.getElementById('sr-city').textContent = display_name.split(',')[0];
+                document.getElementById('sr-val').textContent = pm10r;
+                document.getElementById('sr-val').style.color = level.bg;
+                const badge = document.getElementById('sr-badge');
+                badge.textContent = level.label;
+                badge.style.background = level.bg;
+                document.getElementById('sr-wind').textContent =
+                    `风速 ${speed} m/s · 风向 ${windDirText(dir)} · 坐标 ${latF.toFixed(2)}°N ${lonF.toFixed(2)}°E`;
+
+                // 结果卡边框改为 AQI 颜色
+                const card = document.getElementById('search-result');
+                card.style.borderColor = level.bg;
+                card.style.display = 'block';
+
+            } catch (err) {
+                console.error('[search]', err);
+                alert('查询失败，请检查网络连接。');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '查询';
+            }
+        }
+    </script>
+</body>
+
+</html>
